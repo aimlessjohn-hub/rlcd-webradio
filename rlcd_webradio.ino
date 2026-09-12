@@ -45,7 +45,7 @@ bool displayNeedsUpdate = true;
 uint32_t lastDisplayUpdate = 0;
 
 // --- Homelab & Weather State ---
-const char *STATUS_ENDPOINT = "http://192.168.178.83:8123/status?compact=1";
+const char *STATUS_ENDPOINT = "http://YOUR_BACKEND_HOST:8123/status?compact=1";
 uint32_t lastStatusFetch = 0;
 const uint32_t STATUS_POLL_INTERVAL = 120000; // 2 Minuten
 
@@ -147,7 +147,7 @@ void readBattery() {
 void fetchHomelabStatus() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    Serial.println("[FETCH] Rufe Status von 192.168.178.83 ab...");
+    Serial.println("[FETCH] Rufe Status von YOUR_BACKEND_HOST ab...");
     HTTPClient http;
     http.begin(STATUS_ENDPOINT);
     http.setTimeout(4000);
