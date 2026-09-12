@@ -1,0 +1,6 @@
+build/
+.pio/
+*.o
+*.d
+build/
+.pio/
