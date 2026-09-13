@@ -158,6 +158,10 @@ void fetchHomelabStatus() {
         JsonDocument doc;
         DeserializationError err = deserializeJson(doc, payload);
         if (!err) {
+            // Snapshot vor dem Parsen (fuer Change-Detection unten)
+            float prevWeather = weather_temp_c;
+            float prevHomelab = homelab_w;
+            float prevPveCpu = pve_cpu_pct;
             if (doc["wetter"].is<JsonObjectConst>()) {
                 weather_temp_c = doc["wetter"]["temp_c"] | 0.0f;
                 weather_t_max = doc["wetter"]["t_max"] | 0.0f;
@@ -201,7 +205,13 @@ void fetchHomelabStatus() {
             }
 
             hasServerData = true;
-            displayNeedsUpdate = true;
+            // Display-Refresh nur bei echten Aenderungen (sonst SPI-Refresh
+            // alle 2 min fuer identischen Inhalt = unnoetiger Strom).
+            // serverGenerated bewusst NICHT verglichen (Timestamp aendert sich immer).
+            if (weather_temp_c != prevWeather || homelab_w != prevHomelab ||
+                pve_cpu_pct != prevPveCpu) {
+                displayNeedsUpdate = true;
+            }
             Serial.printf("[FETCH OK] Wetter: %.1f C (Code %d), Homelab: %.1f W, CPU: %.1f%%, RAM: %.1f/%.1f GB\n",
                           weather_temp_c, weather_code, homelab_w, pve_cpu_pct, pve_ram_gb, pve_ram_total_gb);
         } else {
@@ -343,6 +353,7 @@ void setup() {
 void onWifiConnected() {
     if (wifiServicesInitialized) return;
     wifiServicesInitialized = true;
+    WiFi.setSleep(true); // Modem-Sleep aktivieren (Handshake ist fertig) - spart ~70-90 mA!
     Serial.printf("[OK] WLAN verbunden! IP: %s\n", WiFi.localIP().toString().c_str());
     setupOTA();
     setupWebServer();
@@ -862,6 +873,12 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED && !wifiServicesInitialized) {
         onWifiConnected();
     }
+    // Modem-Sleep sicherstellen (AutoReconnect setzt Sleep intern zurueck!):
+    // Nur erzwingen wenn Stream aus (Play braucht volle WLAN-Leistung nicht,
+    // aber Buffering profitiert) - im STOPPED-Dashboard ist Sleep free Gewinn.
+    if (WiFi.status() == WL_CONNECTED && !isPlaying && WiFi.getSleep() != 1) {
+        WiFi.setSleep(true);
+    }
 
     audio.loop();
     if (wifiServicesInitialized) {
@@ -945,16 +962,16 @@ void loop() {
     }
     lastKeyState = keyNow;
 
-    // Refresh Display if requested or fallback every 60s (RLCD ist statisch sparsam)
-    if (displayNeedsUpdate || (millis() - lastDisplayUpdate > 60000)) {
+    // RLCD behaelt den Bildinhalt ohne Strom - Refresh nur bei echten Aenderungen
+    if (displayNeedsUpdate) {
         updateDisplay();
     }
 
-    // Bei aktiver Wiedergabe 2ms fuer stabilen I2S-Stream,
-    // im Dashboard-Modus (Standby) 25ms fuer FreeRTOS CPU-Idle-Sleep
+    // PLAYING: 8ms gibt dem Audio-Task Freiraum (DMA laeuft autonom);
+    // Standby: 50ms senkt CPU-Aufwachzyklen, Taster/WebServer bleiben responsiv
     if (isPlaying) {
-        delay(2);
+        delay(8);
     } else {
-        delay(25);
+        delay(50);
     }
 }
