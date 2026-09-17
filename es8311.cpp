@@ -330,3 +330,26 @@ void ES8311::read_all(){
     }
 }
 
+bool ES8311::setDRC(bool enable) {
+    bool ok = true;
+    if (enable) {
+        // Reg 0x37: Bit 7 = DRC Enable, Bit 3 = EQ Bypass
+        ok &= WriteReg(0x37, 0x88);
+        // Reg 0x38: Target Level / Limiter (-3 dBFS)
+        ok &= WriteReg(0x38, 0x60);
+        // Reg 0x39: Noise gate threshold & hold time
+        ok &= WriteReg(0x39, 0x10);
+        // Reg 0x3A: Attack time (~5ms)
+        ok &= WriteReg(0x3A, 0x05);
+        // Reg 0x3B: Release / Decay time (~100ms)
+        ok &= WriteReg(0x3B, 0x06);
+        Serial.println("[ES8311] Hardware-DRC aktiviert!");
+    } else {
+        // Reg 0x37: DRC disabled (Bit 7 = 0), EQ Bypass (Bit 3 = 1)
+        ok &= WriteReg(0x37, 0x08);
+        Serial.println("[ES8311] Hardware-DRC deaktiviert.");
+    }
+    return ok;
+}
+
+

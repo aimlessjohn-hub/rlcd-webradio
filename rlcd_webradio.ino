@@ -14,6 +14,8 @@
 #include "config.h"
 #include "adc_bsp.h"
 #include "shtc3.h"
+#include "pcf85063.h"
+#include <esp_sntp.h>
 
 // --- Global Objects ---
 Audio audio;
@@ -22,6 +24,10 @@ static ST7305_U8g2 lcd(RLCD_SCK_PIN, RLCD_MOSI_PIN, RLCD_DC_PIN, RLCD_CS_PIN, RL
 static U8G2 *u8g2 = nullptr;
 WebServer server(80);
 Preferences prefs;
+
+// --- Clock & RTC State ---
+bool rtcAvailable = false;
+bool ntpSynced = false;
 
 // --- Battery State ---
 float batteryVoltage = 0.0f;
@@ -44,8 +50,73 @@ bool isPlaying = false;
 bool displayNeedsUpdate = true;
 uint32_t lastDisplayUpdate = 0;
 
+// --- Preset Radio Stations (im NVS-Flash anpassbar) ---
+struct ActiveStation {
+    String name;
+    String url;
+};
+ActiveStation currentPresets[NUM_PRESETS];
+void loadPresets();
+void savePreset(int slot, const String &name, const String &url);
+void resetPresets();
+
+// --- Klang & Psychoakustik Zustand ---
+struct SoundProfile {
+    const char *name;
+    const char *desc;
+    float gainLow;
+    float gainMid;
+    float gainHigh;
+};
+
+const SoundProfile SOUND_PROFILES[] = {
+    {"Warm / Musik",    "Dezenter Bass, warme Mitten gegen Quäken",         1.8f, -1.5f,  1.0f},
+    {"Sprache / News", "Klare Sprachverständlichkeit, schlanke Bässe",     -3.5f,  3.0f,  1.0f},
+    {"Loudness Boost",  "Psychoakustische Fülle bei Zimmerlautstärke",       5.0f, -4.0f,  3.0f},
+    {"Neutral / Flat",  "Unverändertes Originalsignal (linear)",             0.0f,  0.0f,  0.0f}
+};
+
+const int NUM_SOUND_PROFILES = sizeof(SOUND_PROFILES) / sizeof(SOUND_PROFILES[0]);
+int currentSoundProfile = 0;   // Default: Warm / Musik
+bool drcEnabled = true;        // Default: Hardware DRC aktiv
+bool forceMonoEnabled = true;  // Default: Force Mono aktiv
+
+// --- Wecker Zustand ---
+bool alarmEnabled = false;
+int alarmHour = 7;
+int alarmMinute = 0;
+int alarmStation = 0;
+int alarmVolume = 14;
+bool isAlarmActive = false;
+bool isRamping = false;
+uint32_t lastRampTime = 0;
+bool alarmTriggeredThisMinute = false;
+int lastAlarmCheckMinute = -1;
+
+// Schlummerfunktion (Snooze - 9 Minuten)
+bool snoozeActive = false;
+int snoozeHour = 0;
+int snoozeMinute = 0;
+
+// NTP Zeit-Zustand
+char timeStr[16] = "--:--";
+char dateStr[16] = "--.--.";
+int lastMinute = -1;
+
+// Wecker & Sound Funktionsdeklarationen
+void applySoundSettings();
+void saveSoundSettings();
+void loadSoundSettings();
+void saveAlarmSettings();
+void loadAlarmSettings();
+void triggerAlarm();
+void dismissAlarm();
+void snoozeAlarm();
+void checkAlarm(int curHour, int curMin);
+void updateTime();
+
 // --- Homelab & Weather State ---
-const char *STATUS_ENDPOINT = "http://YOUR_BACKEND_HOST:8123/status?compact=1";
+const char *STATUS_ENDPOINT = "http://192.168.178.83:8123/status?compact=1";
 uint32_t lastStatusFetch = 0;
 const uint32_t STATUS_POLL_INTERVAL = 120000; // 2 Minuten
 
@@ -147,7 +218,7 @@ void readBattery() {
 void fetchHomelabStatus() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    Serial.println("[FETCH] Rufe Status von YOUR_BACKEND_HOST ab...");
+    Serial.println("[FETCH] Rufe Status von 192.168.178.83 ab...");
     HTTPClient http;
     http.begin(STATUS_ENDPOINT);
     http.setTimeout(4000);
@@ -158,10 +229,6 @@ void fetchHomelabStatus() {
         JsonDocument doc;
         DeserializationError err = deserializeJson(doc, payload);
         if (!err) {
-            // Snapshot vor dem Parsen (fuer Change-Detection unten)
-            float prevWeather = weather_temp_c;
-            float prevHomelab = homelab_w;
-            float prevPveCpu = pve_cpu_pct;
             if (doc["wetter"].is<JsonObjectConst>()) {
                 weather_temp_c = doc["wetter"]["temp_c"] | 0.0f;
                 weather_t_max = doc["wetter"]["t_max"] | 0.0f;
@@ -205,13 +272,7 @@ void fetchHomelabStatus() {
             }
 
             hasServerData = true;
-            // Display-Refresh nur bei echten Aenderungen (sonst SPI-Refresh
-            // alle 2 min fuer identischen Inhalt = unnoetiger Strom).
-            // serverGenerated bewusst NICHT verglichen (Timestamp aendert sich immer).
-            if (weather_temp_c != prevWeather || homelab_w != prevHomelab ||
-                pve_cpu_pct != prevPveCpu) {
-                displayNeedsUpdate = true;
-            }
+            displayNeedsUpdate = true;
             Serial.printf("[FETCH OK] Wetter: %.1f C (Code %d), Homelab: %.1f W, CPU: %.1f%%, RAM: %.1f/%.1f GB\n",
                           weather_temp_c, weather_code, homelab_w, pve_cpu_pct, pve_ram_gb, pve_ram_total_gb);
         } else {
@@ -295,12 +356,37 @@ void setup() {
         Serial.printf("[SHTC3] Raum: %.1f C, %.1f%% rF\n", roomTemp, roomHumi);
     }
 
+    // PCF85063 Hardware-RTC Init (I2C 0x51)
+    rtcAvailable = pcf85063_init();
+    if (rtcAvailable) {
+        struct tm rtc_ti;
+        if (pcf85063_read_time(&rtc_ti)) {
+            Serial.printf("[RTC] Hardware-Uhrzeit: %02d:%02d:%02d %02d.%02d.%04d\n",
+                          rtc_ti.tm_hour, rtc_ti.tm_min, rtc_ti.tm_sec,
+                          rtc_ti.tm_mday, rtc_ti.tm_mon + 1, rtc_ti.tm_year + 1900);
+            if (rtc_ti.tm_year >= 124) {
+                time_t t = mktime(&rtc_ti);
+                struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+                settimeofday(&tv, NULL);
+                snprintf(timeStr, sizeof(timeStr), "%02d:%02d", rtc_ti.tm_hour, rtc_ti.tm_min);
+                snprintf(dateStr, sizeof(dateStr), "%02d.%02d.", rtc_ti.tm_mday, rtc_ti.tm_mon + 1);
+                Serial.println("[RTC] Systemzeit von Hardware-RTC uebernommen.");
+            }
+        }
+    }
+
     Audio::audio_info_callback = onAudioInfo;
     audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
     audio.setVolume(currentVolume);
     audio.setAudioTaskCore(0); // Native Audio Task on Core 0!
 
-    // 4. Load Saved WiFi credentials or use default
+    // 4. Klang, Psychoakustik, Presets & Wecker initialisieren
+    loadSoundSettings();
+    applySoundSettings();
+    loadPresets();
+    loadAlarmSettings();
+
+    // 5. Load Saved WiFi credentials or use default
     prefs.begin("radio", false);
     String ssid = prefs.getString("ssid", "");
     String pass = prefs.getString("pass", "");
@@ -350,54 +436,391 @@ void setup() {
     updateDisplay();
 }
 
+void onTimeSyncNotification(struct timeval *tv) {
+    ntpSynced = true;
+    time_t now = tv->tv_sec;
+    struct tm ti;
+    localtime_r(&now, &ti);
+    Serial.printf("[NTP] Zeit synchronisiert: %02d:%02d:%02d %02d.%02d.%04d\n",
+                  ti.tm_hour, ti.tm_min, ti.tm_sec, ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d", ti.tm_hour, ti.tm_min);
+    snprintf(dateStr, sizeof(dateStr), "%02d.%02d.", ti.tm_mday, ti.tm_mon + 1);
+    displayNeedsUpdate = true;
+
+    if (rtcAvailable) {
+        pcf85063_set_time(&ti);
+        Serial.println("[RTC] Hardware-Uhr mit NTP kalibriert.");
+    }
+}
+
 void onWifiConnected() {
     if (wifiServicesInitialized) return;
     wifiServicesInitialized = true;
-    WiFi.setSleep(true); // Modem-Sleep aktivieren (Handshake ist fertig) - spart ~70-90 mA!
     Serial.printf("[OK] WLAN verbunden! IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // NTP Zeitsynchronisation mit Callback und multiplen Fallbacks (Berlin)
+    sntp_set_time_sync_notification_cb(onTimeSyncNotification);
+    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com", "192.168.178.1");
+
     setupOTA();
     setupWebServer();
     fetchHomelabStatus();
     // Starte direkt die erste Station
-    playStation(PRESET_STATIONS[0].url, PRESET_STATIONS[0].name);
+    playStation(currentPresets[0].url, currentPresets[0].name);
     displayNeedsUpdate = true;
     updateDisplay();
 }
 
 void setupWebServer() {
     server.on("/", HTTP_GET, []() {
-        String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>RLCD WebRadio & Dashboard</title>";
+        String html;
+        html.reserve(16384);
+        html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>RLCD WebRadio & Dashboard</title>";
         html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-        html += "<style>body{font-family:sans-serif;background:#222;color:#eee;text-align:center;padding:20px;}";
-        html += ".btn{display:inline-block;padding:10px 20px;margin:6px;background:#444;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;text-decoration:none;}";
-        html += ".btn:hover{background:#666;}.card{background:#333;padding:20px;border-radius:10px;display:inline-block;max-width:520px;width:100%;margin-top:15px;text-align:left;}</style></head><body>";
-        html += "<h1>Waveshare RLCD Dashboard</h1>";
+        html += "<style>";
+        html += "* {box-sizing:border-box;}";
+        html += "body {font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#141416;color:#f4f4f5;margin:0;padding:20px 12px;display:flex;justify-content:center;}";
+        html += ".container {width:100%;max-width:520px;display:flex;flex-direction:column;gap:16px;}";
+        html += "h1 {font-size:22px;margin:4px 0;text-align:center;color:#fafafa;}";
+        html += ".card {background:#202024;border:1px solid #323238;border-radius:12px;padding:18px 20px;width:100%;box-shadow:0 4px 10px rgba(0,0,0,0.3);text-align:left;}";
+        html += ".card h2 {font-size:18px;margin:0 0 10px 0;color:#38bdf8;border-bottom:1px solid #2e2e34;padding-bottom:8px;}";
+        html += ".card h3 {font-size:16px;margin:0 0 10px 0;color:#f4f4f5;border-bottom:1px solid #2e2e34;padding-bottom:8px;}";
+        html += "p {margin:7px 0;font-size:14px;line-height:1.45;}";
+        html += ".btn {display:inline-block;padding:9px 14px;background:#3f3f46;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;text-decoration:none;font-weight:600;text-align:center;transition:background 0.15s ease;}";
+        html += ".btn:hover {background:#52525b;}";
+        html += ".btn-primary {background:#2563eb;} .btn-primary:hover {background:#1d4ed8;}";
+        html += ".btn-danger {background:#dc2626;} .btn-danger:hover {background:#b91c1c;}";
+        html += ".btn-success {background:#10b981;} .btn-success:hover {background:#059669;}";
+        html += ".btn-subtle {background:#27272a;border:1px solid #3f3f46;} .btn-subtle:hover {background:#3f3f46;}";
+        html += ".badge-btn {display:inline-block;background:#27272a;color:#a1a1aa;border:1px solid #3f3f46;border-radius:6px;padding:4px 9px;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;transition:all 0.15s;}";
+        html += ".badge-btn:hover {background:#3f3f46;color:#fff;}";
+        html += ".result-item {background:#18181b;border:1px solid #2e2e34;border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:6px;}";
+        html += ".result-title {font-weight:600;color:#f4f4f5;font-size:14px;}";
+        html += ".result-meta {font-size:12px;color:#a1a1aa;}";
+        html += ".tag {display:inline-block;padding:1px 5px;background:#27272a;border-radius:4px;font-size:11px;color:#38bdf8;margin-right:4px;}";
+        html += ".slot-btn {background:#27272a;border:1px solid #3b82f6;color:#38bdf8;padding:5px 8px;border-radius:6px;font-size:12px;font-weight:bold;cursor:pointer;margin:2px;}";
+        html += ".slot-btn:hover {background:#3b82f6;color:#fff;}";
+        html += ".slot-picker {display:flex;gap:4px;align-items:center;margin-top:6px;background:#202024;padding:6px;border-radius:6px;flex-wrap:wrap;}";
+        html += ".station-grid {display:grid;grid-template-columns:repeat(2, 1fr);gap:8px;margin-top:10px;}";
+        html += ".vol-box {display:flex;align-items:center;gap:12px;margin:12px 0;background:#18181b;padding:8px 12px;border-radius:8px;border:1px solid #2e2e34;}";
+        html += ".slider {-webkit-appearance:none;flex:1;height:8px;border-radius:4px;background:#3f3f46;outline:none;cursor:pointer;accent-color:#38bdf8;}";
+        html += "input[type='time'], input[type='number'], select {background:#18181b;border:1px solid #3f3f46;color:#f4f4f5;border-radius:6px;padding:6px 10px;font-size:14px;}";
+        html += "select {width:100%;box-sizing:border-box;}";
+        html += ".info-row {display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #27272a;font-size:14px;}";
+        html += ".info-row:last-child {border-bottom:none;}";
+        html += "</style></head><body>";
+        html += "<div class='container'>";
+        html += "<h1>\xF0\x9F\x93\xBB Waveshare RLCD Dashboard</h1>";
+
+        // Radio Card
         html += "<div class='card'>";
-        html += "<h2>Radio: " + currentStation + "</h2>";
-        html += "<p><strong>Titel:</strong> " + currentTitle + "</p>";
-        html += "<p><strong>Status:</strong> " + streamStatus + " | <strong>Lautst&auml;rke:</strong> " + String(currentVolume) + "/21</p>";
-        html += "<p><a href='/stop' class='btn' style='background:#b22;'>STOP</a>";
-        html += "<a href='/vol?val=" + String(max(0, currentVolume - 2)) + "' class='btn'>Vol -</a>";
-        html += "<a href='/vol?val=" + String(min(21, currentVolume + 2)) + "' class='btn'>Vol +</a></p>";
-        html += "<h3>Stationen</h3>";
+        html += "<h2>\xF0\x9F\x8E\xB5 Radio: <span id='stationName'>" + currentStation + "</span></h2>";
+        html += "<p><strong>Titel:</strong> <span id='stationTitle'>" + currentTitle + "</span></p>";
+        html += "<p><strong>Status:</strong> <span id='streamStat'>" + streamStatus + "</span> &nbsp;|&nbsp; <strong>Lautst&auml;rke:</strong> <span id='volVal'>" + String(currentVolume) + "</span>/21</p>";
+
+        html += "<div class='vol-box'>";
+        html += "<button type='button' onclick='changeVol(-1)' class='btn' style='font-size:18px;padding:4px 14px;'>&minus;</button>";
+        html += "<input type='range' id='volSlider' min='0' max='21' value='" + String(currentVolume) + "' class='slider' oninput='setVol(this.value)'>";
+        html += "<button type='button' onclick='changeVol(1)' class='btn' style='font-size:18px;padding:4px 14px;'>+</button>";
+        html += "</div>";
+
+        html += "<p style='margin-bottom:12px;'><button type='button' onclick='stopRadio()' class='btn btn-danger' style='width:100%;padding:10px 0;'>&#9632; Wiedergabe stoppen</button></p>";
+
+        html += "<div style='display:flex;justify-content:space-between;align-items:center;margin:12px 0 6px 0;'>";
+        html += "<span style='font-weight:600;color:#a1a1aa;'>Favoriten (Presets 1-5):</span>";
+        html += "<button type='button' onclick='resetPresets()' class='badge-btn' title='Auf Werkssender zur&uuml;cksetzen'>&#8634; Standard</button>";
+        html += "</div>";
+        html += "<div class='station-grid'>";
         for (int i = 0; i < NUM_PRESETS; i++) {
-            html += "<a href='/play?station=" + String(i) + "' class='btn'>" + String(PRESET_STATIONS[i].name) + "</a> ";
+            bool isCur = (currentPresetIdx == i);
+            html += "<button type='button' onclick='playRadio(" + String(i) + ")' class='btn " + String(isCur ? "btn-primary" : "btn-subtle") + "' id='pBtn" + String(i) + "'>";
+            html += String(i + 1) + ". " + currentPresets[i].name;
+            html += "</button>";
         }
-        html += "<hr style='border-color:#555;'>";
-        html += "<h3>Homelab & Wetter</h3>";
-        html += "<p>Wetter: " + String(weather_temp_c, 1) + " &deg;C (" + String(getWmoText(weather_code)) + "), Regen: " + String(weather_rain_pct) + "%</p>";
-        html += "<p>Homelab: " + String(homelab_w, 1) + " W | PVE CPU: " + String(pve_cpu_pct, 1) + "% | RAM: " + String(pve_ram_gb, 1) + "/" + String(pve_ram_total_gb, 1) + " GB</p>";
+        html += "</div>";
+        html += "</div>";
+
+        // Sendersuche Card (Radio-Browser)
+        html += "<div class='card'>";
+        html += "<h3>\xF0\x9F\x94\x8D Radio-Browser Sendersuche</h3>";
+        html += "<div style='display:flex;gap:6px;margin-bottom:8px;'>";
+        html += "<input type='text' id='searchInput' placeholder='Sendername, Genre oder Land...' style='flex:1;background:#18181b;border:1px solid #3f3f46;color:#fff;border-radius:6px;padding:8px 10px;font-size:14px;' onkeyup='if(event.key===\"Enter\")searchRadio()'>";
+        html += "<button type='button' onclick='searchRadio()' class='btn btn-primary' style='margin:0;padding:8px 14px;'>Suchen</button>";
+        html += "</div>";
+
+        html += "<div style='display:flex;flex-wrap:wrap;gap:4px;margin-bottom:12px;align-items:center;'>";
+        html += "<span style='font-size:12px;color:#a1a1aa;margin-right:2px;'>Schnellwahl:</span>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"Rock\")'>Rock</button>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"Pop\")'>Pop</button>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"80s\")'>80s</button>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"90s\")'>90s</button>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"Metal\")'>Metal</button>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"Electro\")'>Electro</button>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"Jazz\")'>Jazz</button>";
+        html += "<button type='button' class='badge-btn' onclick='quickSearch(\"News\")'>News</button>";
+        html += "</div>";
+
+        html += "<div id='searchResults' style='max-height:360px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;'>";
+        html += "<p style='color:#71717a;font-size:13px;text-align:center;margin:12px 0;'>Gib einen Suchbegriff ein oder w&auml;hle eine Schnellwahl.</p>";
+        html += "</div>";
+        html += "</div>";
+
+        // Klang & Psychoakustik Card
+        html += "<div class='card'>";
+        html += "<h3>\xF0\x9F\x8E\x9B Klang & Psychoakustik</h3>";
+        html += "<form method='POST' action='/sound/save'>";
+        html += "<p><label><strong>Klangprofil:</strong></label><br>";
+        html += "<select name='profile' style='width:100%;margin:6px 0 10px 0;'>";
+        for (int i = 0; i < NUM_SOUND_PROFILES; i++) {
+            html += "<option value='" + String(i) + "' " + String(currentSoundProfile == i ? "selected" : "") + ">" + String(SOUND_PROFILES[i].name) + " - " + String(SOUND_PROFILES[i].desc) + "</option>";
+        }
+        html += "</select></p>";
+
+        html += "<p><label style='display:flex;align-items:center;cursor:pointer;gap:8px;'>";
+        html += "<input type='checkbox' name='drc' value='1' " + String(drcEnabled ? "checked" : "") + " style='width:18px;height:18px;'> ";
+        html += "<span><strong>Hardware-DRC</strong> <small style='color:#a1a1aa;'>(Dynamik-Kompression & Peak-Limiter)</small></span>";
+        html += "</label></p>";
+
+        html += "<p><label style='display:flex;align-items:center;cursor:pointer;gap:8px;'>";
+        html += "<input type='checkbox' name='mono' value='1' " + String(forceMonoEnabled ? "checked" : "") + " style='width:18px;height:18px;'> ";
+        html += "<span><strong>Mono-Phasenoptimierung</strong> <small style='color:#a1a1aa;'>(kein Ausl&ouml;schen)</small></span>";
+        html += "</label></p>";
+
+        html += "<button type='submit' class='btn btn-primary' style='width:100%;padding:10px;margin-top:6px;'>Klangprofil aktivieren</button>";
+        html += "</form>";
+        html += "</div>";
+
+        // Wecker Card
+        html += "<div class='card'>";
+        html += "<h3>\xE2\x8F\xB0 Radio-Wecker</h3>";
+
+        time_t curNow = time(nullptr);
+        struct tm curTi;
+        localtime_r(&curNow, &curTi);
+        char clockBuf[16] = "--:--:--";
+        if (curTi.tm_year >= 124) {
+            snprintf(clockBuf, sizeof(clockBuf), "%02d:%02d:%02d", curTi.tm_hour, curTi.tm_min, curTi.tm_sec);
+        }
+
+        html += "<div class='info-row' style='margin-bottom:12px;background:#18181b;padding:8px 10px;border-radius:6px;'>";
+        html += "<span>Board-Uhrzeit:</span>";
+        html += "<span><strong id='boardClock' style='color:#38bdf8;font-size:16px;'>" + String(clockBuf) + "</strong> ";
+        html += "<small id='syncBadge' style='color:" + String(ntpSynced ? "#22c55e" : (curTi.tm_year >= 124 ? "#38bdf8" : "#ef4444")) + ";'>";
+        html += ntpSynced ? "(NTP)" : (curTi.tm_year >= 124 ? "(RTC)" : "(nicht synchronisiert)");
+        html += "</small></span></div>";
+
+        html += "<form method='POST' action='/alarm/save'>";
+        char curAlarmTime[8];
+        snprintf(curAlarmTime, sizeof(curAlarmTime), "%02d:%02d", alarmHour, alarmMinute);
+        html += "<p style='display:flex;align-items:center;justify-content:space-between;margin:10px 0;'>";
+        html += "<label><strong>Weckzeit:</strong></label><input type='time' name='time' value='" + String(curAlarmTime) + "' required style='font-size:16px;padding:4px 8px;'></p>";
+
+        html += "<p><label><strong>Weck-Sender:</strong></label><br>";
+        html += "<select name='station' id='alarmStationSelect' style='width:100%;margin-top:6px;'>";
+        for (int i = 0; i < NUM_PRESETS; i++) {
+            html += "<option value='" + String(i) + "' " + String(alarmStation == i ? "selected" : "") + ">" + String(currentPresets[i].name) + "</option>";
+        }
+        html += "</select></p>";
+
+        html += "<p style='display:flex;align-items:center;justify-content:space-between;margin:10px 0;'>";
+        html += "<label><strong>Ziel-Lautst&auml;rke:</strong></label>";
+        html += "<span><input type='number' name='vol' min='5' max='21' value='" + String(alarmVolume) + "' style='width:55px;'> / 21</span></p>";
+        html += "<p style='margin:0 0 12px 0;'><small style='color:#a1a1aa;'>Sanfter Anstieg ab Lautst&auml;rke 5 beim Wecken</small></p>";
+
+        html += "<div style='display:flex;gap:8px;'>";
+        html += "<button type='submit' name='action' value='enable' class='btn btn-success' style='flex:1;padding:11px;font-size:14px;'>";
+        html += alarmEnabled ? "&#128276; Gespeichert (AKTIV um " + String(curAlarmTime) + ")" : "&#128276; Wecker AKTIVIEREN";
+        html += "</button>";
+        if (alarmEnabled) {
+            html += "<button type='submit' name='action' value='disable' class='btn btn-danger' style='padding:11px 14px;'>&#128277; Wecker AUS</button>";
+        }
+        html += "</div>";
+        html += "</form>";
+
+        if (isAlarmActive) {
+            html += "<div style='margin-top:14px;padding:12px;background:#7f1d1d;border-radius:8px;text-align:center;'>";
+            html += "<p style='font-weight:bold;color:#fca5a5;margin:4px 0;'>\xE2\x8F\xB0 WECKER KLINGELT AKTUELL!</p>";
+            html += "<a href='/alarm/dismiss' class='btn btn-danger' style='margin:4px;'>Wecker ausschalten</a> ";
+            html += "<a href='/alarm/snooze' class='btn' style='background:#f59e0b;margin:4px;'>\xF0\x9F\x92\xA4 Schlummern (9 Min)</a>";
+            html += "</div>";
+        } else if (snoozeActive) {
+            char snzHdr[32];
+            snprintf(snzHdr, sizeof(snzHdr), "%02d:%02d", snoozeHour, snoozeMinute);
+            html += "<p style='color:#f59e0b;font-weight:bold;margin-top:10px;'>\xF0\x9F\x92\xA4 Schlummern aktiv bis " + String(snzHdr) + " Uhr &nbsp; <a href='/alarm/dismiss' class='btn' style='background:#b22;padding:4px 10px;font-size:12px;'>Abbrechen</a></p>";
+        }
+        html += "</div>";
+
+        // Homelab & Wetter Card
+        html += "<div class='card'>";
+        html += "<h3>\xF0\x9F\x93\x8A Homelab & Wetter</h3>";
+        html += "<div class='info-row'><span>Wetter:</span><span><strong>" + String(weather_temp_c, 1) + " &deg;C</strong> (" + String(getWmoText(weather_code)) + ")</span></div>";
+        html += "<div class='info-row'><span>Regenwahrscheinlichkeit:</span><span>" + String(weather_rain_pct) + "%</span></div>";
+        html += "<div class='info-row'><span>Min / Max Temperatur:</span><span>" + String(weather_t_min, 1) + " / " + String(weather_t_max, 1) + " &deg;C</span></div>";
         if (shtc3Available) {
-            html += "<p><strong>Raumklima (SHTC3):</strong> " + String(roomTemp, 1) + " &deg;C | " + String(roomHumi, 0) + "% rF</p>";
+            html += "<div class='info-row'><span>Raumklima (SHTC3):</span><span>" + String(roomTemp, 1) + " &deg;C | " + String(roomHumi, 0) + "% rF</span></div>";
         }
-        html += "<p><strong>Akku:</strong> " + String(batteryPercent) + "% (" + String(batteryVoltage, 2) + " V)</p>";
-        html += "<p><small>Stand: " + serverGenerated + "</small></p>";
-        html += "<hr style='border-color:#555;'>";
-        html += "<p style='text-align:center;'>";
-        html += "<a href='/launcher' class='btn' style='font-size:13px;background:#8b5cf6;'>&#128640; Zum MultiBoot Launcher wechseln</a> &nbsp;";
-        html += "<a href='/update' class='btn' style='font-size:13px;background:#555;'>&#9881; OTA Firmware Update</a>";
-        html += "</p>";
-        html += "</div></body></html>";
+        html += "<div class='info-row'><span>Akku:</span><span>" + String(batteryPercent) + "% (" + String(batteryVoltage, 2) + " V)</span></div>";
+        html += "<div class='info-row'><span>Homelab Verbrauch:</span><span>" + String(homelab_w, 1) + " W</span></div>";
+        html += "<div class='info-row'><span>PVE CPU &amp; RAM:</span><span>" + String(pve_cpu_pct, 1) + "% | " + String(pve_ram_gb, 1) + " / " + String(pve_ram_total_gb, 1) + " GB</span></div>";
+        html += "<p style='margin-top:12px;margin-bottom:0;'><small style='color:#71717a;'>Stand: " + serverGenerated + "</small></p>";
+        html += "</div>";
+
+        // System & Launcher Card
+        html += "<div class='card' style='text-align:center;'>";
+        html += "<div style='display:flex;gap:10px;justify-content:center;flex-wrap:wrap;'>";
+        html += "<a href='/launcher' class='btn' style='background:#7c3aed;flex:1 1 180px;'>\xF0\x9F\x9A\x80 Zum MultiBoot Launcher</a>";
+        html += "<a href='/update' class='btn btn-subtle' style='flex:1 1 180px;'>\xE2\x9A\x99 OTA Firmware Update</a>";
+        html += "</div></div>";
+        html += "</div>"; // Container end
+
+        html += "<script>";
+        html += "let curVol = " + String(currentVolume) + ";";
+        html += "let debounceTimer = null;";
+        html += "let foundStations = [];";
+        html += "function setVol(val) {";
+        html += "  curVol = parseInt(val);";
+        html += "  document.getElementById('volVal').innerText = curVol;";
+        html += "  document.getElementById('volSlider').value = curVol;";
+        html += "  clearTimeout(debounceTimer);";
+        html += "  debounceTimer = setTimeout(() => {";
+        html += "    fetch('/vol?val=' + curVol + '&ajax=1').catch(e=>console.log(e));";
+        html += "  }, 120);";
+        html += "}";
+        html += "function changeVol(delta) {";
+        html += "  let nv = Math.max(0, Math.min(21, curVol + delta));";
+        html += "  setVol(nv);";
+        html += "}";
+        html += "function playRadio(idx) {";
+        html += "  fetch('/play?station=' + idx + '&ajax=1').then(()=>{setTimeout(()=>location.reload(), 600);}).catch(e=>console.log(e));";
+        html += "}";
+        html += "function stopRadio() {";
+        html += "  fetch('/stop?ajax=1').then(()=>{setTimeout(()=>location.reload(), 400);}).catch(e=>console.log(e));";
+        html += "}";
+        html += "function escapeHtml(str) {";
+        html += "  return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');";
+        html += "}";
+        html += "function quickSearch(tag) {";
+        html += "  let el = document.getElementById('searchInput');";
+        html += "  if (el) el.value = tag;";
+        html += "  searchRadio();";
+        html += "}";
+        html += "function searchRadio() {";
+        html += "  let q = document.getElementById('searchInput').value.trim();";
+        html += "  if (!q) return;";
+        html += "  let resDiv = document.getElementById('searchResults');";
+        html += "  resDiv.innerHTML = '<p style=\"color:#a1a1aa;text-align:center;padding:12px;\">\xE2\x8F\xB3 Suche nach &quot;' + escapeHtml(q) + '&quot;...</p>';";
+        html += "  let url = 'https://de1.api.radio-browser.info/json/stations/search?name=' + encodeURIComponent(q) + '&limit=12&order=votes&reverse=true';";
+        html += "  fetch(url).then(r => r.json()).then(data => renderResults(data)).catch(err => {";
+        html += "    fetch('https://all.api.radio-browser.info/json/stations/search?name=' + encodeURIComponent(q) + '&limit=12&order=votes&reverse=true')";
+        html += "      .then(r => r.json()).then(data => renderResults(data))";
+        html += "      .catch(e => { resDiv.innerHTML = '<p style=\"color:#ef4444;text-align:center;padding:12px;\">Fehler bei der Suche.</p>'; });";
+        html += "  });";
+        html += "}";
+        html += "function renderResults(stations) {";
+        html += "  foundStations = stations || [];";
+        html += "  let resDiv = document.getElementById('searchResults');";
+        html += "  if (!foundStations.length) {";
+        html += "    resDiv.innerHTML = '<p style=\"color:#a1a1aa;text-align:center;padding:12px;\">Keine Sender gefunden.</p>';";
+        html += "    return;";
+        html += "  }";
+        html += "  let h = '';";
+        html += "  foundStations.forEach((s, idx) => {";
+        html += "    let codec = (s.codec || 'MP3').toUpperCase();";
+        html += "    let br = s.bitrate ? s.bitrate + 'k' : '';";
+        html += "    let country = s.countrycode || s.country || '';";
+        html += "    let name = (s.name || 'Unbekannt').trim();";
+        html += "    h += '<div class=\"result-item\">';";
+        html += "    h += '<div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:8px;\">';";
+        html += "    h += '<div style=\"flex:1;min-width:160px;\">';";
+        html += "    h += '<div class=\"result-title\">' + escapeHtml(name) + '</div>';";
+        html += "    h += '<div class=\"result-meta\"><span class=\"tag\">' + escapeHtml(codec) + '</span>';";
+        html += "    if (br) h += ' <span class=\"tag\">' + escapeHtml(br) + '</span>';";
+        html += "    if (country) h += ' <span class=\"tag\">' + escapeHtml(country) + '</span>';";
+        html += "    h += '</div></div>';";
+        html += "    h += '<div style=\"display:flex;gap:6px;flex-shrink:0;\">';";
+        html += "    h += '<button class=\"btn btn-success badge-btn\" onclick=\"playCustomIdx(' + idx + ')\">&#9654; Abspielen</button>';";
+        html += "    h += '<button class=\"btn btn-subtle badge-btn\" onclick=\"showSlotPicker(' + idx + ')\">&#11088; Preset...</button>';";
+        html += "    h += '</div></div>';";
+        html += "    h += '<div id=\"slotPicker_' + idx + '\" class=\"slot-picker\" style=\"display:none;\">';";
+        html += "    h += '<span style=\"font-size:12px;color:#a1a1aa;margin-right:4px;\">Auf Taste:</span>';";
+        html += "    for (let slot = 0; slot < 5; slot++) {";
+        html += "      h += '<button class=\"slot-btn\" onclick=\"assignPreset(' + idx + ',' + slot + ')\">P' + (slot + 1) + '</button>';";
+        html += "    }";
+        html += "    h += '<button class=\"slot-btn\" style=\"border-color:#71717a;color:#a1a1aa;\" onclick=\"hideSlotPicker(' + idx + ')\">&times;</button>';";
+        html += "    h += '</div></div>';";
+        html += "  });";
+        html += "  resDiv.innerHTML = h;";
+        html += "}";
+        html += "function showSlotPicker(idx) {";
+        html += "  let el = document.getElementById('slotPicker_' + idx);";
+        html += "  if (el) el.style.display = 'flex';";
+        html += "}";
+        html += "function hideSlotPicker(idx) {";
+        html += "  let el = document.getElementById('slotPicker_' + idx);";
+        html += "  if (el) el.style.display = 'none';";
+        html += "}";
+        html += "function playCustomIdx(idx) {";
+        html += "  let s = foundStations[idx];";
+        html += "  if (!s) return;";
+        html += "  let streamUrl = s.url_resolved || s.url;";
+        html += "  let name = (s.name || 'Custom Stream').trim();";
+        html += "  fetch('/play?url=' + encodeURIComponent(streamUrl) + '&name=' + encodeURIComponent(name) + '&ajax=1')";
+        html += "    .then(() => { setTimeout(pollStatus, 800); })";
+        html += "    .catch(e => console.log(e));";
+        html += "}";
+        html += "function assignPreset(idx, slot) {";
+        html += "  let s = foundStations[idx];";
+        html += "  if (!s) return;";
+        html += "  let streamUrl = s.url_resolved || s.url;";
+        html += "  let name = (s.name || 'Station ' + (slot + 1)).trim();";
+        html += "  hideSlotPicker(idx);";
+        html += "  fetch('/preset/save?slot=' + slot + '&name=' + encodeURIComponent(name) + '&url=' + encodeURIComponent(streamUrl))";
+        html += "    .then(r => r.json())";
+        html += "    .then(d => {";
+        html += "      if (d.result === 'ok') {";
+        html += "        let btn = document.getElementById('pBtn' + slot);";
+        html += "        if (btn) btn.innerText = (slot + 1) + '. ' + name;";
+        html += "        let sel = document.getElementById('alarmStationSelect');";
+        html += "        if (sel && sel.options[slot]) sel.options[slot].text = name;";
+        html += "      }";
+        html += "    }).catch(e => console.log(e));";
+        html += "}";
+        html += "function resetPresets() {";
+        html += "  if (!confirm('Alle Presets (1-5) auf Standard-Sender zur\\u00fccksetzen?')) return;";
+        html += "  fetch('/preset/reset').then(r => r.json()).then(d => {";
+        html += "    if (d.result === 'ok') location.reload();";
+        html += "  }).catch(e => console.log(e));";
+        html += "}";
+        html += "function pollStatus() {";
+        html += "  fetch('/status').then(r=>r.json()).then(d=>{";
+        html += "    if (d.title && document.getElementById('stationTitle')) document.getElementById('stationTitle').innerText = d.title;";
+        html += "    if (d.station && document.getElementById('stationName')) document.getElementById('stationName').innerText = d.station;";
+        html += "    if (d.status && document.getElementById('streamStat')) document.getElementById('streamStat').innerText = d.status;";
+        html += "    let slider = document.getElementById('volSlider');";
+        html += "    if (d.volume !== undefined && slider && document.activeElement !== slider) {";
+        html += "      curVol = d.volume;";
+        html += "      document.getElementById('volVal').innerText = curVol;";
+        html += "      slider.value = curVol;";
+        html += "    }";
+        html += "    if (d.clock && document.getElementById('boardClock')) {";
+        html += "      document.getElementById('boardClock').innerText = d.clock;";
+        html += "    }";
+        html += "    if (d.time_synced !== undefined && document.getElementById('syncBadge')) {";
+        html += "      document.getElementById('syncBadge').innerText = d.time_synced ? (d.ntp_synced ? '(NTP)' : '(RTC)') : '(nicht synchronisiert)';";
+        html += "      document.getElementById('syncBadge').style.color = d.time_synced ? '#22c55e' : '#ef4444';";
+        html += "    }";
+        html += "    if (d.presets) {";
+        html += "      d.presets.forEach((p, i) => {";
+        html += "        let btn = document.getElementById('pBtn' + i);";
+        html += "        if (btn) btn.innerText = (i + 1) + '. ' + p.name;";
+        html += "        let sel = document.getElementById('alarmStationSelect');";
+        html += "        if (sel && sel.options[i]) sel.options[i].text = p.name;";
+        html += "      });";
+        html += "    }";
+        html += "  }).catch(()=>{});";
+        html += "}";
+        html += "setInterval(pollStatus, 4000);";
+        html += "</script></body></html>";
         server.send(200, "text/html", html);
     });
 
@@ -408,6 +831,23 @@ void setupWebServer() {
         doc["title"] = currentTitle;
         doc["volume"] = currentVolume;
         doc["ip"] = WiFi.localIP().toString();
+
+        time_t now = time(nullptr);
+        struct tm ti;
+        localtime_r(&now, &ti);
+        if (ti.tm_year >= 124) {
+            char tbuf[16];
+            snprintf(tbuf, sizeof(tbuf), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+            doc["clock"] = tbuf;
+            doc["time_synced"] = true;
+            doc["rtc_available"] = rtcAvailable;
+            doc["ntp_synced"] = ntpSynced;
+        } else {
+            doc["clock"] = "--:--:--";
+            doc["time_synced"] = false;
+            doc["rtc_available"] = rtcAvailable;
+            doc["ntp_synced"] = false;
+        }
 
         JsonObject bat = doc["battery"].to<JsonObject>();
         bat["voltage"] = batteryVoltage;
@@ -437,9 +877,93 @@ void setupWebServer() {
 
         doc["generated"] = serverGenerated;
 
+        JsonObject alm = doc["alarm"].to<JsonObject>();
+        alm["enabled"] = alarmEnabled;
+        alm["hour"] = alarmHour;
+        alm["minute"] = alarmMinute;
+        alm["station"] = alarmStation;
+        alm["station_name"] = currentPresets[alarmStation].name;
+        alm["volume"] = alarmVolume;
+        alm["is_active"] = isAlarmActive;
+        alm["snooze_active"] = snoozeActive;
+
+        JsonArray pa = doc["presets"].to<JsonArray>();
+        for (int i = 0; i < NUM_PRESETS; i++) {
+            JsonObject p = pa.add<JsonObject>();
+            p["name"] = currentPresets[i].name;
+            p["url"] = currentPresets[i].url;
+        }
+
+        JsonObject snd = doc["sound"].to<JsonObject>();
+        snd["profile"] = currentSoundProfile;
+        snd["profile_name"] = SOUND_PROFILES[currentSoundProfile].name;
+        snd["drc"] = drcEnabled;
+        snd["force_mono"] = forceMonoEnabled;
+
         String out;
         serializeJson(doc, out);
         server.send(200, "application/json", out);
+    });
+
+    server.on("/alarm/save", HTTP_ANY, []() {
+        if (server.hasArg("action")) {
+            String act = server.arg("action");
+            if (act == "enable") {
+                alarmEnabled = true;
+            } else if (act == "disable") {
+                alarmEnabled = false;
+            }
+        } else if (server.hasArg("enabled")) {
+            alarmEnabled = (server.arg("enabled") == "1" || server.arg("enabled") == "on");
+        }
+
+        if (server.hasArg("time")) {
+            String t = server.arg("time");
+            int colon = t.indexOf(':');
+            if (colon > 0) {
+                alarmHour = t.substring(0, colon).toInt();
+                alarmMinute = t.substring(colon + 1).toInt();
+            }
+        }
+        if (server.hasArg("station")) {
+            alarmStation = constrain(server.arg("station").toInt(), 0, NUM_PRESETS - 1);
+        }
+        if (server.hasArg("vol")) {
+            alarmVolume = constrain(server.arg("vol").toInt(), 5, 21);
+        }
+        alarmTriggeredThisMinute = false;
+        saveAlarmSettings();
+        displayNeedsUpdate = true;
+        Serial.printf("[ALARM] Gespeichert: %s um %02d:%02d, Sender %d, Vol %d\n",
+                      alarmEnabled ? "EIN" : "AUS", alarmHour, alarmMinute, alarmStation + 1, alarmVolume);
+        server.sendHeader("Location", "/");
+        server.send(303);
+    });
+
+    server.on("/alarm/dismiss", HTTP_GET, []() {
+        dismissAlarm();
+        server.sendHeader("Location", "/");
+        server.send(303);
+    });
+
+    server.on("/alarm/snooze", HTTP_GET, []() {
+        snoozeAlarm();
+        server.sendHeader("Location", "/");
+        server.send(303);
+    });
+
+    server.on("/sound/save", HTTP_ANY, []() {
+        if (server.hasArg("profile")) {
+            currentSoundProfile = constrain(server.arg("profile").toInt(), 0, NUM_SOUND_PROFILES - 1);
+        }
+        drcEnabled = server.hasArg("drc") && (server.arg("drc") == "1" || server.arg("drc") == "on");
+        forceMonoEnabled = server.hasArg("mono") && (server.arg("mono") == "1" || server.arg("mono") == "on");
+
+        saveSoundSettings();
+        applySoundSettings();
+
+        server.sendHeader("Location", "/");
+        server.send(303);
     });
 
     server.on("/play", HTTP_GET, []() {
@@ -447,31 +971,67 @@ void setupWebServer() {
             int idx = server.arg("station").toInt();
             if (idx >= 0 && idx < NUM_PRESETS) {
                 currentPresetIdx = idx;
-                playStation(PRESET_STATIONS[idx].url, PRESET_STATIONS[idx].name);
+                playStation(currentPresets[idx].url, currentPresets[idx].name);
             }
         } else if (server.hasArg("url")) {
             String url = server.arg("url");
             String name = server.hasArg("name") ? server.arg("name") : "Custom Stream";
             playStation(url, name);
         }
-        server.send(200, "application/json", "{\"result\":\"ok\"}");
+        if (server.hasArg("ajax") || server.hasHeader("X-Requested-With")) {
+            server.send(200, "application/json", "{\"result\":\"ok\"}");
+        } else {
+            server.sendHeader("Location", "/");
+            server.send(303);
+        }
     });
 
     server.on("/stop", HTTP_GET, []() {
         stopStation();
-        server.send(200, "application/json", "{\"result\":\"stopped\"}");
+        if (server.hasArg("ajax") || server.hasHeader("X-Requested-With")) {
+            server.send(200, "application/json", "{\"result\":\"stopped\"}");
+        } else {
+            server.sendHeader("Location", "/");
+            server.send(303);
+        }
     });
 
     server.on("/vol", HTTP_GET, []() {
         if (server.hasArg("val")) {
             setVolume(server.arg("val").toInt());
         }
-        server.send(200, "application/json", "{\"volume\":" + String(currentVolume) + "}");
+        if (server.hasArg("ajax") || server.hasHeader("X-Requested-With")) {
+            server.send(200, "application/json", "{\"volume\":" + String(currentVolume) + "}");
+        } else {
+            server.sendHeader("Location", "/");
+            server.send(303);
+        }
     });
 
     server.on("/fetch", HTTP_GET, []() {
         fetchHomelabStatus();
         server.send(200, "application/json", "{\"result\":\"fetched\"}");
+    });
+
+    server.on("/preset/save", HTTP_ANY, []() {
+        if (server.hasArg("slot") && server.hasArg("name") && server.hasArg("url")) {
+            int slot = server.arg("slot").toInt();
+            String name = server.arg("name");
+            String url = server.arg("url");
+            if (slot >= 0 && slot < NUM_PRESETS) {
+                savePreset(slot, name, url);
+                displayNeedsUpdate = true;
+                server.send(200, "application/json", "{\"result\":\"ok\",\"slot\":" + String(slot) + "}");
+                return;
+            }
+        }
+        server.send(400, "application/json", "{\"result\":\"error\",\"message\":\"invalid params\"}");
+    });
+
+    server.on("/preset/reset", HTTP_ANY, []() {
+        resetPresets();
+        displayNeedsUpdate = true;
+        server.send(200, "application/json", "{\"result\":\"ok\"}");
     });
 
     // Web OTA Update
@@ -650,6 +1210,195 @@ void setVolume(int vol) {
     Serial.printf("Lautstaerke: %d/21\n", currentVolume);
 }
 
+void applySoundSettings() {
+    audio.forceMono(forceMonoEnabled);
+    const SoundProfile &p = SOUND_PROFILES[currentSoundProfile];
+    audio.setTone(p.gainLow, p.gainMid, p.gainHigh);
+    es.setDRC(drcEnabled);
+    Serial.printf("[AUDIO DSP] Profil [%d]: %s (B:%.1f M:%.1f H:%.1f), DRC: %s, Mono: %s\n",
+                  currentSoundProfile, p.name, p.gainLow, p.gainMid, p.gainHigh,
+                  drcEnabled ? "EIN" : "AUS", forceMonoEnabled ? "EIN" : "AUS");
+}
+
+void saveSoundSettings() {
+    Preferences soundPrefs;
+    soundPrefs.begin("radio_sound", false);
+    soundPrefs.putInt("profile", currentSoundProfile);
+    soundPrefs.putBool("drc", drcEnabled);
+    soundPrefs.putBool("mono", forceMonoEnabled);
+    soundPrefs.end();
+}
+
+void loadSoundSettings() {
+    Preferences soundPrefs;
+    soundPrefs.begin("radio_sound", true);
+    currentSoundProfile = constrain(soundPrefs.getInt("profile", 0), 0, NUM_SOUND_PROFILES - 1);
+    drcEnabled = soundPrefs.getBool("drc", true);
+    forceMonoEnabled = soundPrefs.getBool("mono", true);
+    soundPrefs.end();
+}
+
+void loadPresets() {
+    Preferences presetPrefs;
+    presetPrefs.begin("presets", true);
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        String nKey = "n" + String(i);
+        String uKey = "u" + String(i);
+        String sName = presetPrefs.getString(nKey.c_str(), "");
+        String sUrl  = presetPrefs.getString(uKey.c_str(), "");
+        if (sName.length() > 0 && sUrl.length() > 0) {
+            currentPresets[i].name = sName;
+            currentPresets[i].url  = sUrl;
+        } else {
+            currentPresets[i].name = PRESET_STATIONS[i].name;
+            currentPresets[i].url  = PRESET_STATIONS[i].url;
+        }
+    }
+    presetPrefs.end();
+}
+
+void savePreset(int slot, const String &name, const String &url) {
+    if (slot < 0 || slot >= NUM_PRESETS) return;
+    currentPresets[slot].name = name;
+    currentPresets[slot].url  = url;
+
+    Preferences presetPrefs;
+    presetPrefs.begin("presets", false);
+    String nKey = "n" + String(slot);
+    String uKey = "u" + String(slot);
+    presetPrefs.putString(nKey.c_str(), name);
+    presetPrefs.putString(uKey.c_str(), url);
+    presetPrefs.end();
+    Serial.printf("[PRESET] Slot %d belegt mit '%s' (%s)\n", slot + 1, name.c_str(), url.c_str());
+}
+
+void resetPresets() {
+    Preferences presetPrefs;
+    presetPrefs.begin("presets", false);
+    presetPrefs.clear();
+    presetPrefs.end();
+    for (int i = 0; i < NUM_PRESETS; i++) {
+        currentPresets[i].name = PRESET_STATIONS[i].name;
+        currentPresets[i].url  = PRESET_STATIONS[i].url;
+    }
+    Serial.println("[PRESET] Alle Presets auf Werkssender zurueckgesetzt.");
+}
+
+void saveAlarmSettings() {
+    Preferences alarmPrefs;
+    alarmPrefs.begin("radio_alarm", false);
+    alarmPrefs.putBool("enabled", alarmEnabled);
+    alarmPrefs.putInt("hour", alarmHour);
+    alarmPrefs.putInt("min", alarmMinute);
+    alarmPrefs.putInt("station", alarmStation);
+    alarmPrefs.putInt("vol", alarmVolume);
+    alarmPrefs.end();
+}
+
+void loadAlarmSettings() {
+    Preferences alarmPrefs;
+    alarmPrefs.begin("radio_alarm", true);
+    alarmEnabled = alarmPrefs.getBool("enabled", false);
+    alarmHour = alarmPrefs.getInt("hour", 7);
+    alarmMinute = alarmPrefs.getInt("min", 0);
+    alarmStation = constrain(alarmPrefs.getInt("station", 0), 0, NUM_PRESETS - 1);
+    alarmVolume = constrain(alarmPrefs.getInt("vol", 14), 5, 21);
+    alarmPrefs.end();
+}
+
+void triggerAlarm() {
+    isAlarmActive = true;
+    isRamping = true;
+    lastRampTime = millis();
+    snoozeActive = false;
+    currentVolume = 5; // Sanfter Start
+    setVolume(currentVolume);
+    currentPresetIdx = alarmStation;
+    playStation(currentPresets[alarmStation].url, currentPresets[alarmStation].name);
+    displayNeedsUpdate = true;
+    Serial.printf("[WECKER] *** WECKER AUSGELOEST! *** Sender: %s, Ziel-Lautstaerke: %d\n",
+                  currentPresets[alarmStation].name.c_str(), alarmVolume);
+}
+
+void dismissAlarm() {
+    isAlarmActive = false;
+    isRamping = false;
+    snoozeActive = false;
+    stopStation();
+    displayNeedsUpdate = true;
+    Serial.println("[WECKER] Wecker ausgeschaltet (Dismiss).");
+}
+
+void snoozeAlarm() {
+    isAlarmActive = false;
+    isRamping = false;
+    stopStation();
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 10)) {
+        int m = timeinfo.tm_min + 9;
+        int h = timeinfo.tm_hour;
+        if (m >= 60) {
+            m -= 60;
+            h = (h + 1) % 24;
+        }
+        snoozeHour = h;
+        snoozeMinute = m;
+        snoozeActive = true;
+        Serial.printf("[WECKER] Schlummerfunktion aktiv bis %02d:%02d\n", snoozeHour, snoozeMinute);
+    }
+    displayNeedsUpdate = true;
+}
+
+void checkAlarm(int curHour, int curMin) {
+    if (curMin != lastAlarmCheckMinute) {
+        lastAlarmCheckMinute = curMin;
+        alarmTriggeredThisMinute = false;
+    }
+
+    if (!alarmTriggeredThisMinute && !isAlarmActive) {
+        if (snoozeActive && curHour == snoozeHour && curMin == snoozeMinute) {
+            alarmTriggeredThisMinute = true;
+            snoozeActive = false;
+            triggerAlarm();
+        } else if (alarmEnabled && curHour == alarmHour && curMin == alarmMinute) {
+            alarmTriggeredThisMinute = true;
+            triggerAlarm();
+        }
+    }
+}
+
+void updateTime() {
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    bool validTime = false;
+
+    if (timeinfo.tm_year >= 124) { // Jahr >= 2024
+        validTime = true;
+    } else if (rtcAvailable && pcf85063_read_time(&timeinfo)) {
+        if (timeinfo.tm_year >= 124) {
+            validTime = true;
+            time_t t = mktime(&timeinfo);
+            struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+        }
+    }
+
+    if (validTime) {
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+        snprintf(dateStr, sizeof(dateStr), "%02d.%02d.", timeinfo.tm_mday, timeinfo.tm_mon + 1);
+
+        if (timeinfo.tm_min != lastMinute) {
+            lastMinute = timeinfo.tm_min;
+            displayNeedsUpdate = true;
+        }
+
+        checkAlarm(timeinfo.tm_hour, timeinfo.tm_min);
+    }
+}
+
+
 void updateDisplay() {
     u8g2->clearBuffer();
     u8g2->setDrawColor(1);
@@ -662,13 +1411,20 @@ void updateDisplay() {
     u8g2->drawStr(8, 20, "DASHBOARD");
 
     u8g2->setFont(u8g2_font_6x10_tr);
-    // Zeitstempel ohne Sekunden formatieren (z. B. "10.09. 20:58")
-    String timeStr = serverGenerated;
-    if (timeStr.length() >= 14 && timeStr.charAt(timeStr.length() - 3) == ':') {
-        timeStr = timeStr.substring(0, timeStr.length() - 3);
+    // Zeitstempel ohne Sekunden formatieren (z. B. "20:58" oder von Homelab)
+    String curTimeStr = (timeStr[0] != '-') ? String(timeStr) : serverGenerated;
+    if (curTimeStr.length() >= 14 && curTimeStr.charAt(curTimeStr.length() - 3) == ':') {
+        curTimeStr = curTimeStr.substring(0, curTimeStr.length() - 3);
     }
-    if (timeStr.length() > 0 && timeStr != "--:--") {
-        u8g2->drawStr(122, 20, timeStr.c_str());
+    if (curTimeStr.length() > 0 && curTimeStr != "--:--") {
+        u8g2->drawStr(98, 20, curTimeStr.c_str());
+    }
+
+    // Wecker-Status im Header
+    if (alarmEnabled) {
+        char almHdr[16];
+        snprintf(almHdr, sizeof(almHdr), "ALM %02d:%02d", alarmHour, alarmMinute);
+        u8g2->drawStr(138, 20, almHdr);
     }
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -694,9 +1450,13 @@ void updateDisplay() {
     u8g2->drawHLine(2, 25, 396);
 
     // --- Radio Section (Top half) ---
-    // Station Name
+    // Station Name or Alarm Banner
     u8g2->setFont(u8g2_font_helvB14_tr);
-    u8g2->drawStr(12, 45, currentStation.c_str());
+    if (isAlarmActive) {
+        u8g2->drawStr(12, 45, "*** WECKER AKTIV ***");
+    } else {
+        u8g2->drawStr(12, 45, currentStation.c_str());
+    }
 
     // Status Badge & Vol
     u8g2->setFont(u8g2_font_6x10_tr);
@@ -803,7 +1563,17 @@ void updateDisplay() {
     // --- Bottom Bar: Button Guide ---
     u8g2->drawHLine(2, 272, 396);
     u8g2->setFont(u8g2_font_6x10_tr);
-    u8g2->drawStr(10, 288, "[BOOT] Sender / Vol-    [KEY] Play/Stop / Vol+");
+    if (isAlarmActive) {
+        u8g2->drawStr(10, 288, "[BOOT] Schlummern (9 Min)    [KEY] Wecker ausschalten");
+    } else if (snoozeActive) {
+        char snzBuf[64];
+        snprintf(snzBuf, sizeof(snzBuf), "Schlummern bis %02d:%02d | [KEY] Aus", snoozeHour, snoozeMinute);
+        u8g2->drawStr(10, 288, snzBuf);
+    } else {
+        char footerStr[64];
+        snprintf(footerStr, sizeof(footerStr), "[BOOT] Sender/Vol-  [KEY] Play/Vol+  | DSP: %s", SOUND_PROFILES[currentSoundProfile].name);
+        u8g2->drawStr(10, 288, footerStr);
+    }
 
     u8g2->sendBuffer();
     displayNeedsUpdate = false;
@@ -825,7 +1595,7 @@ void handleSerialCommands() {
             int idx = line.substring(8).toInt();
             if (idx >= 0 && idx < NUM_PRESETS) {
                 currentPresetIdx = idx;
-                playStation(PRESET_STATIONS[idx].url, PRESET_STATIONS[idx].name);
+                playStation(currentPresets[idx].url, currentPresets[idx].name);
             }
         } else if (line == "STOP") {
             stopStation();
@@ -873,12 +1643,6 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED && !wifiServicesInitialized) {
         onWifiConnected();
     }
-    // Modem-Sleep sicherstellen (AutoReconnect setzt Sleep intern zurueck!):
-    // Nur erzwingen wenn Stream aus (Play braucht volle WLAN-Leistung nicht,
-    // aber Buffering profitiert) - im STOPPED-Dashboard ist Sleep free Gewinn.
-    if (WiFi.status() == WL_CONNECTED && !isPlaying && WiFi.getSleep() != 1) {
-        WiFi.setSleep(true);
-    }
 
     audio.loop();
     if (wifiServicesInitialized) {
@@ -911,9 +1675,26 @@ void loop() {
         fetchHomelabStatus();
     }
 
+    // Uhrzeit aktualisieren & Wecker prüfen
+    updateTime();
+
+    // Sanfter Weckstart (Lautstärke schrittweise alle 4s anheben)
+    if (isAlarmActive && isRamping) {
+        if (millis() - lastRampTime >= 4000) {
+            lastRampTime = millis();
+            if (currentVolume < alarmVolume) {
+                setVolume(currentVolume + 1);
+            } else {
+                isRamping = false;
+            }
+        }
+    }
+
     uint32_t now = millis();
 
-    // 1. BOOT button: Short -> Next Preset, Long -> Volume DOWN
+    // 1. BOOT button:
+    // Wenn Wecker aktiv: Schlummern (9 Min)
+    // Sonst: Short -> Next Preset, Long -> Volume DOWN
     bool bootNow = digitalRead(BTN_BOOT);
     if (bootNow == LOW && lastBootState == HIGH) {
         bootPressTime = now;
@@ -924,19 +1705,27 @@ void loop() {
             if (now - lastBootRepeat >= 180) {
                 lastBootRepeat = now;
                 bootHandledLong = true;
-                setVolume(currentVolume - 1);
+                if (!isAlarmActive) {
+                    setVolume(currentVolume - 1);
+                }
             }
         }
     } else if (bootNow == HIGH && lastBootState == LOW) {
         if (!bootHandledLong && (now - bootPressTime > 40)) {
-            // Short press: Next station
-            currentPresetIdx = (currentPresetIdx + 1) % NUM_PRESETS;
-            playStation(PRESET_STATIONS[currentPresetIdx].url, PRESET_STATIONS[currentPresetIdx].name);
+            if (isAlarmActive) {
+                snoozeAlarm();
+            } else {
+                // Short press: Next station
+                currentPresetIdx = (currentPresetIdx + 1) % NUM_PRESETS;
+                playStation(currentPresets[currentPresetIdx].url, currentPresets[currentPresetIdx].name);
+            }
         }
     }
     lastBootState = bootNow;
 
-    // 2. KEY button: Short -> Play/Pause, Long -> Volume UP
+    // 2. KEY button:
+    // Wenn Wecker aktiv: Wecker ausschalten (Dismiss)
+    // Sonst: Short -> Play/Pause, Long -> Volume UP
     bool keyNow = digitalRead(BTN_KEY);
     if (keyNow == LOW && lastKeyState == HIGH) {
         keyPressTime = now;
@@ -947,31 +1736,37 @@ void loop() {
             if (now - lastKeyRepeat >= 180) {
                 lastKeyRepeat = now;
                 keyHandledLong = true;
-                setVolume(currentVolume + 1);
+                if (!isAlarmActive) {
+                    setVolume(currentVolume + 1);
+                }
             }
         }
     } else if (keyNow == HIGH && lastKeyState == LOW) {
         if (!keyHandledLong && (now - keyPressTime > 40)) {
-            // Short press: Toggle Play / Stop
-            if (isPlaying) {
-                stopStation();
+            if (isAlarmActive) {
+                dismissAlarm();
             } else {
-                playStation(PRESET_STATIONS[currentPresetIdx].url, PRESET_STATIONS[currentPresetIdx].name);
+                // Short press: Toggle Play / Stop
+                if (isPlaying) {
+                    stopStation();
+                } else {
+                    playStation(currentPresets[currentPresetIdx].url, currentPresets[currentPresetIdx].name);
+                }
             }
         }
     }
     lastKeyState = keyNow;
 
-    // RLCD behaelt den Bildinhalt ohne Strom - Refresh nur bei echten Aenderungen
-    if (displayNeedsUpdate) {
+    // Refresh Display if requested or fallback every 60s (RLCD ist statisch sparsam)
+    if (displayNeedsUpdate || (millis() - lastDisplayUpdate > 60000)) {
         updateDisplay();
     }
 
-    // PLAYING: 8ms gibt dem Audio-Task Freiraum (DMA laeuft autonom);
-    // Standby: 50ms senkt CPU-Aufwachzyklen, Taster/WebServer bleiben responsiv
+    // Bei aktiver Wiedergabe 2ms fuer stabilen I2S-Stream,
+    // im Dashboard-Modus (Standby) 25ms fuer FreeRTOS CPU-Idle-Sleep
     if (isPlaying) {
-        delay(8);
+        delay(2);
     } else {
-        delay(50);
+        delay(25);
     }
 }

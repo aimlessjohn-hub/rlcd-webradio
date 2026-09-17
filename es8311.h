@@ -41,6 +41,7 @@ public:
     uint8_t getMicrophoneGain();
     bool standby();
     bool resume();
+    bool setDRC(bool enable);
     void read_all();
 protected:
     int get_coeff(uint32_t mclk, uint32_t rate);
